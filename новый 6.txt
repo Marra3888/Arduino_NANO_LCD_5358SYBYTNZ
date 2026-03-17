@@ -1,0 +1,312 @@
+#include <Arduino.h>
+
+/*
+  COLUMN SCANNER for custom SED1520-like LCD
+  ==========================================
+
+  Arduino Nano wiring:
+
+    D2  -> CN10-9   (D0)
+    D3  -> CN10-10  (D1)
+    D4  -> CN10-11  (D2)
+    D5  -> CN10-12  (D3)
+    D6  -> CN10-13  (D4)
+    D7  -> CN10-14  (D5)
+    D8  -> CN10-15  (D6)
+    D9  -> CN10-16  (D7)
+
+    D10 -> CN10-4   (A0)
+    D11 -> CN10-5   (write gate / mode)
+    D12 -> CN10-8   (main write strobe)
+    A1  -> CN10-18  (CS2)
+    A2  -> CN10-17  (RST)
+
+  Model from latest VCD:
+    - CN10-8 = main strobe
+    - CN10-5 = write-window line (LOW only during write)
+    - CN10-18 = CS2
+    - CN10-17 = RST active HIGH
+    - SED1520-like
+    - duty 1/16
+*/
+
+/* ---------------- Commands ---------------- */
+#define CMD_DISPLAY_OFF          0xAE
+#define CMD_DISPLAY_ON           0xAF
+#define CMD_DISPLAY_START_LINE   0xC0
+#define CMD_SET_PAGE             0xB8
+#define CMD_SET_COLUMN           0x00
+#define CMD_ADC_FORWARD          0xA0
+#define CMD_STATIC_DRIVE_OFF     0xA4
+#define CMD_DUTY_16              0xA8
+#define CMD_RESET                0xE2
+
+/* ---------------- Pins ---------------- */
+const uint8_t LCD_DB[8] = {2,3,4,5,6,7,8,9};
+
+#define LCD_PIN_A0    10   // CN10-4
+#define LCD_PIN_MODE  11   // CN10-5
+#define LCD_PIN_STB   12   // CN10-8
+#define LCD_PIN_CS2   A1   // CN10-18
+#define LCD_PIN_RST   A2   // CN10-17
+
+/* ---------------- Geometry ---------------- */
+#define LCD_PAGES      2
+#define LCD_RAM_COLS   80
+
+/* ---------------- Polarity ---------------- */
+#define RST_ACTIVE_HIGH   1
+#define A0_DATA_HIGH      1
+#define STB_ACTIVE_LOW    1
+#define CS2_ACTIVE_LOW    1
+
+/* ---------------- Timing ---------------- */
+#define T_SETUP_US   2
+#define T_PULSE_US   2
+#define T_HOLD_US    2
+
+/* ---------------- Scan settings ---------------- */
+#define SCAN_DELAY_MS  3000   // скорость сканирования
+
+/* ============================================================
+   Low level
+   ============================================================ */
+static inline void pinW(uint8_t pin, bool level)
+{
+  digitalWrite(pin, level ? HIGH : LOW);
+}
+
+static inline bool activeToLevel(bool active, bool activeLow)
+{
+  return activeLow ? !active : active;
+}
+
+static inline void setA0(bool isData)
+{
+  pinW(LCD_PIN_A0, A0_DATA_HIGH ? isData : !isData);
+}
+
+static inline void setCS2(bool active)
+{
+  pinW(LCD_PIN_CS2, activeToLevel(active, CS2_ACTIVE_LOW));
+}
+
+static inline void setRST(bool active)
+{
+  pinW(LCD_PIN_RST, RST_ACTIVE_HIGH ? active : !active);
+}
+
+static inline void modeIdle(void)
+{
+  // CN10-5 idle HIGH
+  pinW(LCD_PIN_MODE, HIGH);
+}
+
+static inline void modeWriteBegin(void)
+{
+  // CN10-5 LOW only during write
+  pinW(LCD_PIN_MODE, LOW);
+}
+
+static inline void modeWriteEnd(void)
+{
+  pinW(LCD_PIN_MODE, HIGH);
+}
+
+static inline void stbIdle(void)
+{
+  pinW(LCD_PIN_STB, activeToLevel(false, STB_ACTIVE_LOW));
+}
+
+static inline void pulseStrobe(void)
+{
+  pinW(LCD_PIN_STB, activeToLevel(true, STB_ACTIVE_LOW));
+  delayMicroseconds(T_PULSE_US);
+  pinW(LCD_PIN_STB, activeToLevel(false, STB_ACTIVE_LOW));
+}
+
+static inline void setDataBus(uint8_t value)
+{
+  for (uint8_t i = 0; i < 8; i++)
+    pinW(LCD_DB[i], (value >> i) & 1);
+}
+
+/* ============================================================
+   Write selected half
+   cs2Active = false -> one chip
+   cs2Active = true  -> second chip
+   ============================================================ */
+static void lcdWriteByte(bool cs2Active, bool isData, uint8_t value)
+{
+  setA0(isData);
+  setDataBus(value);
+
+  modeIdle();
+  delayMicroseconds(1);
+
+  modeWriteBegin();
+  setCS2(cs2Active);
+
+  delayMicroseconds(T_SETUP_US);
+  pulseStrobe();
+
+  setCS2(false);
+  modeWriteEnd();
+
+  delayMicroseconds(T_HOLD_US);
+}
+
+static inline void lcdCmd(bool cs2Active, uint8_t cmd)
+{
+  lcdWriteByte(cs2Active, false, cmd);
+}
+
+static inline void lcdData(bool cs2Active, uint8_t data)
+{
+  lcdWriteByte(cs2Active, true, data);
+}
+
+/* ============================================================
+   Base commands
+   ============================================================ */
+static void lcdResetHw(void)
+{
+  modeIdle();
+  setCS2(false);
+  setA0(false);
+  stbIdle();
+
+  setRST(true);
+  delay(30);
+  setRST(false);
+  delay(60);
+}
+
+static void lcdSetPageCol(bool cs2Active, uint8_t page, uint8_t col)
+{
+  if (col >= LCD_RAM_COLS) col = LCD_RAM_COLS - 1;
+
+  lcdCmd(cs2Active, CMD_SET_PAGE | (page & 0x03));
+  lcdCmd(cs2Active, CMD_SET_COLUMN | col);
+}
+
+static void lcdInitChip(bool cs2Active)
+{
+  lcdCmd(cs2Active, CMD_DISPLAY_OFF);        delay(4);
+  lcdCmd(cs2Active, CMD_RESET);              delay(4);
+  lcdCmd(cs2Active, CMD_DUTY_16);            delay(4);
+  lcdCmd(cs2Active, CMD_ADC_FORWARD);        delay(4);
+  lcdCmd(cs2Active, CMD_STATIC_DRIVE_OFF);   delay(4);
+  lcdCmd(cs2Active, CMD_DISPLAY_START_LINE); delay(4);
+  lcdCmd(cs2Active, CMD_DISPLAY_ON);         delay(4);
+}
+
+static void lcdInit(void)
+{
+  lcdResetHw();
+  lcdInitChip(false);  // CS2 OFF
+  lcdInitChip(true);   // CS2 ON
+}
+
+/* ============================================================
+   Helpers
+   ============================================================ */
+static void clearChip(bool cs2Active)
+{
+  for (uint8_t page = 0; page < LCD_PAGES; page++)
+  {
+    lcdSetPageCol(cs2Active, page, 0);
+    for (uint8_t col = 0; col < LCD_RAM_COLS; col++)
+      lcdData(cs2Active, 0x00);
+
+    delayMicroseconds(200);
+  }
+}
+
+static void clearAll(void)
+{
+  clearChip(false); // CS2 OFF chip
+  clearChip(true);  // CS2 ON chip
+}
+
+static void showColumnFullHeight(bool cs2Active, uint8_t localCol)
+{
+  clearAll();
+
+  // page 0
+  lcdSetPageCol(cs2Active, 0, localCol);
+  lcdData(cs2Active, 0xFF);
+
+  // page 1
+  lcdSetPageCol(cs2Active, 1, localCol);
+  lcdData(cs2Active, 0xFF);
+}
+
+static const char* chipName(bool cs2Active)
+{
+  return cs2Active ? "CS2_ON" : "CS2_OFF";
+}
+
+/* ============================================================
+   Main scan
+   ============================================================ */
+static void scanChip(bool cs2Active)
+{
+  Serial.println();
+  Serial.print(F("=== SCAN "));
+  Serial.print(chipName(cs2Active));
+  Serial.println(F(" ==="));
+
+  for (uint8_t col = 0; col < LCD_RAM_COLS; col++)
+  {
+    Serial.print(F("chip="));
+    Serial.print(chipName(cs2Active));
+    Serial.print(F(" local_col="));
+    Serial.println(col);
+
+    showColumnFullHeight(cs2Active, col);
+    delay(SCAN_DELAY_MS);
+  }
+
+  clearAll();
+  delay(500);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(LCD_PIN_A0, OUTPUT);
+  pinMode(LCD_PIN_MODE, OUTPUT);
+  pinMode(LCD_PIN_STB, OUTPUT);
+  pinMode(LCD_PIN_CS2, OUTPUT);
+  pinMode(LCD_PIN_RST, OUTPUT);
+
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    pinMode(LCD_DB[i], OUTPUT);
+    digitalWrite(LCD_DB[i], LOW);
+  }
+
+  modeIdle();
+  setCS2(false);
+  setA0(false);
+  stbIdle();
+  setRST(false);
+
+  delay(50);
+
+  lcdInit();
+
+  Serial.println(F("COLUMN SCANNER START"));
+  delay(500);
+}
+
+void loop()
+{
+  // Сначала чип при CS2=OFF
+  scanChip(false);
+
+  // Потом чип при CS2=ON
+  scanChip(true);
+}

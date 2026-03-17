@@ -1,0 +1,510 @@
+#include <Arduino.h>
+#include <avr/pgmspace.h>
+
+/*
+  SED1520-like LCD
+  =================
+
+  Arduino Nano wiring:
+
+    D2  -> CN10-9   (D0)
+    D3  -> CN10-10  (D1)
+    D4  -> CN10-11  (D2)
+    D5  -> CN10-12  (D3)
+    D6  -> CN10-13  (D4)
+    D7  -> CN10-14  (D5)
+    D8  -> CN10-15  (D6)
+    D9  -> CN10-16  (D7)
+
+    D10 -> CN10-4   (A0)
+    D11 -> CN10-5   (WRITE mode / R/W-like)
+    D12 -> CN10-8   (main write strobe)
+    A1  -> CN10-18  (CS2)
+    A2  -> CN10-17  (RST)
+
+  Принятая модель:
+    LEFT  chip = CS2 active
+    RIGHT chip = CS2 inactive
+
+  Геометрия по твоему резюме:
+    67 cols per chip
+    total visible width = 134
+    height = 16
+    pages = 2
+*/
+
+/* ============================================================
+   Команды SED1520
+   ============================================================ */
+#define CMD_DISPLAY_OFF          0xAE
+#define CMD_DISPLAY_ON           0xAF
+#define CMD_DISPLAY_START_LINE   0xC0
+#define CMD_SET_PAGE             0xB8
+#define CMD_SET_COLUMN           0x00
+#define CMD_ADC_FORWARD          0xA0
+#define CMD_ADC_REVERSE          0xA1
+#define CMD_STATIC_DRIVE_OFF     0xA4
+#define CMD_DUTY_16              0xA9
+#define CMD_RESET                0xE2
+
+/* ============================================================
+   Пины
+   ============================================================ */
+const uint8_t LCD_DB[8] = {2,3,4,5,6,7,8,9};
+
+#define LCD_PIN_A0    10   // CN10-4
+#define LCD_PIN_MODE  11   // CN10-5
+#define LCD_PIN_STB   12   // CN10-8
+#define LCD_PIN_CS2   A1   // CN10-18
+#define LCD_PIN_RST   A2   // CN10-17
+
+/* ============================================================
+   Геометрия
+   ============================================================ */
+#define LCD_WIDTH            134
+#define LCD_HEIGHT           16
+#define LCD_PAGES            2
+#define LCD_HALF_WIDTH       67
+#define LCD_RAM_COLS         80
+#define LCD_CHARS_PER_LINE   22   // 134 / 6 = 22 с небольшим остатком
+
+// По твоему описанию H8 пишет с колонки 0
+#define COL_START_LEFT       0
+#define COL_START_RIGHT      0
+
+/* ============================================================
+   Полярности / настройки
+   ============================================================ */
+#define RST_ACTIVE_HIGH      1
+#define A0_DATA_HIGH         1
+#define CS2_ACTIVE_LOW       1
+
+/*
+  CN10-5 — write/read-like line.
+  Для записи считаем:
+    LOW = write
+*/
+#define MODE_WRITE_LOW       1
+
+/*
+  CN10-8 — основной write strobe, по VCD active LOW
+*/
+#define STB_ACTIVE_LOW       1
+
+/*
+  Если текст вдруг зеркальный по X -> 1
+*/
+#define LCD_ADC_REVERSED     0
+
+/*
+  Если буквы окажутся перевёрнуты в строке по вертикали -> 0
+*/
+#define FONT_LSB_TOP         1
+
+/* ============================================================
+   Тайминги
+   ============================================================ */
+#define T_SETUP_US   2
+#define T_PULSE_US   2
+#define T_HOLD_US    2
+
+/* ============================================================
+   Левый/правый физический чип
+   ============================================================ */
+#define PHYS_LEFT   1   // CS2 active
+#define PHYS_RIGHT  0   // CS2 inactive
+
+/* ============================================================
+   Буфер [page][x]
+   ============================================================ */
+static uint8_t lcd_fb[LCD_PAGES][LCD_WIDTH];
+
+/* ============================================================
+   Low level
+   ============================================================ */
+static inline void pinW(uint8_t pin, bool level)
+{
+  digitalWrite(pin, level ? HIGH : LOW);
+}
+
+static inline bool activeToLevel(bool active, bool activeLow)
+{
+  return activeLow ? !active : active;
+}
+
+static inline void setA0(bool isData)
+{
+  pinW(LCD_PIN_A0, A0_DATA_HIGH ? isData : !isData);
+}
+
+static inline void setCS2(bool active)
+{
+  pinW(LCD_PIN_CS2, activeToLevel(active, CS2_ACTIVE_LOW));
+}
+
+static inline void setRST(bool active)
+{
+  pinW(LCD_PIN_RST, RST_ACTIVE_HIGH ? active : !active);
+}
+
+static inline void setWriteMode(void)
+{
+  // запись = LOW
+  pinW(LCD_PIN_MODE, MODE_WRITE_LOW ? LOW : HIGH);
+}
+
+static inline void stbIdle(void)
+{
+  pinW(LCD_PIN_STB, activeToLevel(false, STB_ACTIVE_LOW));
+}
+
+static inline void pulseStrobe(void)
+{
+  pinW(LCD_PIN_STB, activeToLevel(true, STB_ACTIVE_LOW));
+  delayMicroseconds(T_PULSE_US);
+  pinW(LCD_PIN_STB, activeToLevel(false, STB_ACTIVE_LOW));
+}
+
+static void setDataBus(uint8_t value)
+{
+  for (uint8_t i = 0; i < 8; i++)
+    pinW(LCD_DB[i], (value >> i) & 1);
+}
+
+/* ============================================================
+   Запись байта
+   ============================================================ */
+static void writePhys(uint8_t physChip, bool isData, uint8_t value)
+{
+  setWriteMode();
+  setA0(isData);
+  setDataBus(value);
+
+  // LEFT = CS2 active, RIGHT = CS2 inactive
+  if (physChip == PHYS_LEFT) setCS2(true);
+  else                       setCS2(false);
+
+  delayMicroseconds(T_SETUP_US);
+  pulseStrobe();
+  delayMicroseconds(T_HOLD_US);
+
+  setCS2(false);
+}
+
+static inline void lcdCmdPhys(uint8_t physChip, uint8_t cmd)
+{
+  writePhys(physChip, false, cmd);
+}
+
+static inline void lcdDataPhys(uint8_t physChip, uint8_t data)
+{
+  writePhys(physChip, true, data);
+}
+
+/* ============================================================
+   Базовые команды
+   ============================================================ */
+static void lcdResetHw(void)
+{
+  setWriteMode();
+  setCS2(false);
+  setA0(false);
+  stbIdle();
+
+  setRST(true);
+  delay(30);
+  setRST(false);
+  delay(60);
+}
+
+static void lcdSetPageColPhys(uint8_t physChip, uint8_t page, uint8_t col)
+{
+  uint8_t base = (physChip == PHYS_LEFT) ? COL_START_LEFT : COL_START_RIGHT;
+  uint8_t physCol = base + col;
+
+  if (physCol >= LCD_RAM_COLS) return;
+
+  lcdCmdPhys(physChip, CMD_SET_PAGE | (page & 0x03));
+  lcdCmdPhys(physChip, CMD_SET_COLUMN | physCol);
+}
+
+static void lcdInitPhysChip(uint8_t physChip)
+{
+  // Тот init, на котором у тебя контраст нормальный
+  lcdCmdPhys(physChip, CMD_DISPLAY_OFF);
+  delay(4);
+
+  lcdCmdPhys(physChip, CMD_RESET);
+  delay(4);
+
+  lcdCmdPhys(physChip, CMD_DUTY_16);
+  delay(4);
+
+#if LCD_ADC_REVERSED
+  lcdCmdPhys(physChip, CMD_ADC_REVERSE);
+#else
+  lcdCmdPhys(physChip, CMD_ADC_FORWARD);
+#endif
+  delay(4);
+
+  lcdCmdPhys(physChip, CMD_STATIC_DRIVE_OFF);
+  delay(4);
+
+  lcdCmdPhys(physChip, CMD_DISPLAY_START_LINE | 0);
+  delay(4);
+
+  lcdCmdPhys(physChip, CMD_DISPLAY_ON);
+  delay(4);
+}
+
+static void lcdInit(void)
+{
+  lcdResetHw();
+
+  // Сначала left, потом right
+  lcdInitPhysChip(PHYS_LEFT);
+  lcdInitPhysChip(PHYS_RIGHT);
+}
+
+/* ============================================================
+   Буфер / update
+   ============================================================ */
+static void lcdBufClear(void)
+{
+  for (uint8_t p = 0; p < LCD_PAGES; p++)
+    for (uint8_t x = 0; x < LCD_WIDTH; x++)
+      lcd_fb[p][x] = 0x00;
+}
+
+static void lcdBufClearPage(uint8_t page)
+{
+  if (page >= LCD_PAGES) return;
+  for (uint8_t x = 0; x < LCD_WIDTH; x++)
+    lcd_fb[page][x] = 0x00;
+}
+
+static void lcdBufFill(uint8_t value)
+{
+  for (uint8_t p = 0; p < LCD_PAGES; p++)
+    for (uint8_t x = 0; x < LCD_WIDTH; x++)
+      lcd_fb[p][x] = value;
+}
+
+static void lcdUpdate(void)
+{
+  for (uint8_t page = 0; page < LCD_PAGES; page++)
+  {
+    // LEFT
+    lcdSetPageColPhys(PHYS_LEFT, page, 0);
+    for (uint8_t x = 0; x < LCD_HALF_WIDTH; x++)
+      lcdDataPhys(PHYS_LEFT, lcd_fb[page][x]);
+
+    // RIGHT
+    lcdSetPageColPhys(PHYS_RIGHT, page, 0);
+    for (uint8_t x = 0; x < LCD_HALF_WIDTH; x++)
+      lcdDataPhys(PHYS_RIGHT, lcd_fb[page][LCD_HALF_WIDTH + x]);
+  }
+}
+
+static void lcdAllOn(void)
+{
+  lcdBufFill(0xFF);
+  lcdUpdate();
+}
+
+/* ============================================================
+   Шрифт 5x7
+   ============================================================ */
+static const uint8_t GLYPH_SPACE[5] PROGMEM = {0x00,0x00,0x00,0x00,0x00};
+static const uint8_t GLYPH_DASH [5] PROGMEM = {0x08,0x08,0x08,0x08,0x08};
+static const uint8_t GLYPH_DOT  [5] PROGMEM = {0x00,0x60,0x60,0x00,0x00};
+static const uint8_t GLYPH_COLON[5] PROGMEM = {0x00,0x36,0x36,0x00,0x00};
+static const uint8_t GLYPH_SLASH[5] PROGMEM = {0x20,0x10,0x08,0x04,0x02};
+
+static const uint8_t GLYPH_0[5] PROGMEM = {0x3E,0x51,0x49,0x45,0x3E};
+static const uint8_t GLYPH_1[5] PROGMEM = {0x00,0x42,0x7F,0x40,0x00};
+static const uint8_t GLYPH_2[5] PROGMEM = {0x42,0x61,0x51,0x49,0x46};
+static const uint8_t GLYPH_3[5] PROGMEM = {0x21,0x41,0x45,0x4B,0x31};
+static const uint8_t GLYPH_4[5] PROGMEM = {0x18,0x14,0x12,0x7F,0x10};
+static const uint8_t GLYPH_5[5] PROGMEM = {0x27,0x45,0x45,0x45,0x39};
+static const uint8_t GLYPH_6[5] PROGMEM = {0x3C,0x4A,0x49,0x49,0x30};
+static const uint8_t GLYPH_7[5] PROGMEM = {0x01,0x71,0x09,0x05,0x03};
+static const uint8_t GLYPH_8[5] PROGMEM = {0x36,0x49,0x49,0x49,0x36};
+static const uint8_t GLYPH_9[5] PROGMEM = {0x06,0x49,0x49,0x29,0x1E};
+
+static const uint8_t GLYPH_A[5] PROGMEM = {0x7E,0x11,0x11,0x11,0x7E};
+static const uint8_t GLYPH_B[5] PROGMEM = {0x7F,0x49,0x49,0x49,0x36};
+static const uint8_t GLYPH_C[5] PROGMEM = {0x3E,0x41,0x41,0x41,0x22};
+static const uint8_t GLYPH_D[5] PROGMEM = {0x7F,0x41,0x41,0x22,0x1C};
+static const uint8_t GLYPH_E[5] PROGMEM = {0x7F,0x49,0x49,0x49,0x41};
+static const uint8_t GLYPH_F[5] PROGMEM = {0x7F,0x09,0x09,0x09,0x01};
+static const uint8_t GLYPH_G[5] PROGMEM = {0x3E,0x41,0x49,0x49,0x7A};
+static const uint8_t GLYPH_H[5] PROGMEM = {0x7F,0x08,0x08,0x08,0x7F};
+static const uint8_t GLYPH_I[5] PROGMEM = {0x00,0x41,0x7F,0x41,0x00};
+static const uint8_t GLYPH_J[5] PROGMEM = {0x20,0x40,0x41,0x3F,0x01};
+static const uint8_t GLYPH_K[5] PROGMEM = {0x7F,0x08,0x14,0x22,0x41};
+static const uint8_t GLYPH_L[5] PROGMEM = {0x7F,0x40,0x40,0x40,0x40};
+static const uint8_t GLYPH_M[5] PROGMEM = {0x7F,0x02,0x0C,0x02,0x7F};
+static const uint8_t GLYPH_N[5] PROGMEM = {0x7F,0x04,0x08,0x10,0x7F};
+static const uint8_t GLYPH_O[5] PROGMEM = {0x3E,0x41,0x41,0x41,0x3E};
+static const uint8_t GLYPH_P[5] PROGMEM = {0x7F,0x09,0x09,0x09,0x06};
+static const uint8_t GLYPH_Q[5] PROGMEM = {0x3E,0x41,0x51,0x21,0x5E};
+static const uint8_t GLYPH_R[5] PROGMEM = {0x7F,0x09,0x19,0x29,0x46};
+static const uint8_t GLYPH_S[5] PROGMEM = {0x46,0x49,0x49,0x49,0x31};
+static const uint8_t GLYPH_T[5] PROGMEM = {0x01,0x01,0x7F,0x01,0x01};
+static const uint8_t GLYPH_U[5] PROGMEM = {0x3F,0x40,0x40,0x40,0x3F};
+static const uint8_t GLYPH_V[5] PROGMEM = {0x1F,0x20,0x40,0x20,0x1F};
+static const uint8_t GLYPH_W[5] PROGMEM = {0x7F,0x20,0x18,0x20,0x7F};
+static const uint8_t GLYPH_X[5] PROGMEM = {0x63,0x14,0x08,0x14,0x63};
+static const uint8_t GLYPH_Y[5] PROGMEM = {0x03,0x04,0x78,0x04,0x03};
+static const uint8_t GLYPH_Z[5] PROGMEM = {0x61,0x51,0x49,0x45,0x43};
+
+static const uint8_t* lcdGlyph(char c)
+{
+  if (c >= 'a' && c <= 'z') c -= 32;
+
+  switch (c)
+  {
+    case ' ': return GLYPH_SPACE;
+    case '-': return GLYPH_DASH;
+    case '.': return GLYPH_DOT;
+    case ':': return GLYPH_COLON;
+    case '/': return GLYPH_SLASH;
+
+    case '0': return GLYPH_0;
+    case '1': return GLYPH_1;
+    case '2': return GLYPH_2;
+    case '3': return GLYPH_3;
+    case '4': return GLYPH_4;
+    case '5': return GLYPH_5;
+    case '6': return GLYPH_6;
+    case '7': return GLYPH_7;
+    case '8': return GLYPH_8;
+    case '9': return GLYPH_9;
+
+    case 'A': return GLYPH_A;
+    case 'B': return GLYPH_B;
+    case 'C': return GLYPH_C;
+    case 'D': return GLYPH_D;
+    case 'E': return GLYPH_E;
+    case 'F': return GLYPH_F;
+    case 'G': return GLYPH_G;
+    case 'H': return GLYPH_H;
+    case 'I': return GLYPH_I;
+    case 'J': return GLYPH_J;
+    case 'K': return GLYPH_K;
+    case 'L': return GLYPH_L;
+    case 'M': return GLYPH_M;
+    case 'N': return GLYPH_N;
+    case 'O': return GLYPH_O;
+    case 'P': return GLYPH_P;
+    case 'Q': return GLYPH_Q;
+    case 'R': return GLYPH_R;
+    case 'S': return GLYPH_S;
+    case 'T': return GLYPH_T;
+    case 'U': return GLYPH_U;
+    case 'V': return GLYPH_V;
+    case 'W': return GLYPH_W;
+    case 'X': return GLYPH_X;
+    case 'Y': return GLYPH_Y;
+    case 'Z': return GLYPH_Z;
+  }
+
+  return GLYPH_SPACE;
+}
+
+static uint8_t lcdOrientGlyphByte(uint8_t b)
+{
+#if FONT_LSB_TOP
+  return b;
+#else
+  uint8_t r = 0;
+  for (uint8_t i = 0; i < 7; i++)
+    if (b & (1 << i))
+      r |= (1 << (6 - i));
+  return r;
+#endif
+}
+
+/* ============================================================
+   Текст
+   ============================================================ */
+static void lcdBufPrintLine(uint8_t page, const char* s)
+{
+  if (page >= LCD_PAGES) return;
+
+  lcdBufClearPage(page);
+
+  uint8_t x = 0;
+  uint8_t chars = 0;
+
+  while (*s && chars < LCD_CHARS_PER_LINE && x < LCD_WIDTH)
+  {
+    const uint8_t* g = lcdGlyph(*s);
+
+    for (uint8_t i = 0; i < 6; i++)
+    {
+      uint8_t b = 0x00;
+      if (i < 5) b = pgm_read_byte(g + i);
+      b = lcdOrientGlyphByte(b);
+
+      if (x >= LCD_WIDTH) break;
+      lcd_fb[page][x++] = b;
+    }
+
+    s++;
+    chars++;
+  }
+}
+
+static void lcdShowFullText(const char* line1, const char* line2)
+{
+  lcdBufClear();
+  lcdBufPrintLine(0, line1);
+  lcdBufPrintLine(1, line2);
+  lcdUpdate();
+}
+
+/* ============================================================
+   Arduino
+   ============================================================ */
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(LCD_PIN_A0, OUTPUT);
+  pinMode(LCD_PIN_MODE, OUTPUT);
+  pinMode(LCD_PIN_STB, OUTPUT);
+  pinMode(LCD_PIN_CS2, OUTPUT);
+  pinMode(LCD_PIN_RST, OUTPUT);
+
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    pinMode(LCD_DB[i], OUTPUT);
+    digitalWrite(LCD_DB[i], LOW);
+  }
+
+  setWriteMode();
+  setCS2(false);
+  setA0(false);
+  stbIdle();
+  setRST(false);
+
+  delay(50);
+
+  lcdInit();
+
+  // Полная заливка
+  lcdAllOn();
+  delay(1000);
+
+  // Текст на весь экран
+  lcdShowFullText(
+    "1234567890123456789012",
+    "ABCDEFGHIJKLMNOPQRSTUV"
+  );
+}
+
+void loop()
+{
+}

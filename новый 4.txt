@@ -1,0 +1,370 @@
+#include <Arduino.h>
+
+/*
+  Short final diagnostic for second chip
+  ======================================
+
+  Arduino Nano wiring:
+
+    D2  -> CN10-9   (D0)
+    D3  -> CN10-10  (D1)
+    D4  -> CN10-11  (D2)
+    D5  -> CN10-12  (D3)
+    D6  -> CN10-13  (D4)
+    D7  -> CN10-14  (D5)
+    D8  -> CN10-15  (D6)
+    D9  -> CN10-16  (D7)
+
+    D10 -> CN10-4   (A0)
+    D11 -> CN10-5   (candidate WR / mode)
+    D12 -> CN10-8   (candidate STB / WR1)
+    A1  -> CN10-18  (candidate CS2)
+    A2  -> CN10-17  (RST)
+*/
+
+/* ---------------- SED1520 commands ---------------- */
+#define CMD_DISPLAY_OFF          0xAE
+#define CMD_DISPLAY_ON           0xAF
+#define CMD_DISPLAY_START_LINE   0xC0
+#define CMD_SET_PAGE             0xB8
+#define CMD_SET_COLUMN           0x00
+#define CMD_ADC_FORWARD          0xA0
+#define CMD_STATIC_DRIVE_OFF     0xA4
+#define CMD_DUTY_16              0xA8
+#define CMD_RESET                0xE2
+
+/* ---------------- Pins ---------------- */
+const uint8_t DB[8] = {2,3,4,5,6,7,8,9};
+
+#define PIN_A0    10   // CN10-4
+#define PIN_5     11   // CN10-5
+#define PIN_8     12   // CN10-8
+#define PIN_CS2   A1   // CN10-18
+#define PIN_RST   A2   // CN10-17
+
+/* ---------------- Geometry ---------------- */
+#define LCD_HALF_WIDTH  67
+#define LCD_PAGES       2
+#define LCD_RAM_COLS    80
+
+#define COL_START       0
+
+/* ---------------- Polarity ---------------- */
+#define RST_ACTIVE_HIGH  1
+
+/* ---------------- Timing ---------------- */
+#define T_SETUP_US  3
+#define T_PULSE_US  4
+#define T_HOLD_US   3
+
+enum TestMode : uint8_t
+{
+  MODE_STB_ONLY = 0,
+  MODE_WR_ONLY,
+  MODE_WR_AND_STB,
+  MODE_CS2_INV_STB
+};
+
+static TestMode gMode = MODE_STB_ONLY;
+
+static const char* modeName(TestMode m)
+{
+  switch (m)
+  {
+    case MODE_STB_ONLY:    return "STB_ONLY";
+    case MODE_WR_ONLY:     return "WR_ONLY";
+    case MODE_WR_AND_STB:  return "WR_AND_STB";
+    default:               return "CS2_INV_STB";
+  }
+}
+
+/* ============================================================
+   Low level
+   ============================================================ */
+static inline void pinW(uint8_t pin, bool level)
+{
+  digitalWrite(pin, level ? HIGH : LOW);
+}
+
+static inline void setRST(bool active)
+{
+  pinW(PIN_RST, RST_ACTIVE_HIGH ? active : !active);
+}
+
+static inline void setA0(bool isData)
+{
+  // предполагаем A0=1 -> data
+  pinW(PIN_A0, isData ? HIGH : LOW);
+}
+
+static inline void setCS2(bool active)
+{
+  // базово считаем CS2 active LOW
+  pinW(PIN_CS2, active ? LOW : HIGH);
+}
+
+static inline void setDB(uint8_t v)
+{
+  for (uint8_t i = 0; i < 8; i++)
+    pinW(DB[i], (v >> i) & 1);
+}
+
+static inline void idlePins(void)
+{
+  // CN10-5 и CN10-8 в idle HIGH как для active-low strobes
+  pinW(PIN_5, HIGH);
+  pinW(PIN_8, HIGH);
+  setCS2(false);
+  setA0(false);
+}
+
+static inline void pulsePin5(void)
+{
+  pinW(PIN_5, LOW);
+  delayMicroseconds(T_PULSE_US);
+  pinW(PIN_5, HIGH);
+}
+
+static inline void pulsePin8(void)
+{
+  pinW(PIN_8, LOW);
+  delayMicroseconds(T_PULSE_US);
+  pinW(PIN_8, HIGH);
+}
+
+static inline void pulseBoth(void)
+{
+  pinW(PIN_5, LOW);
+  pinW(PIN_8, LOW);
+  delayMicroseconds(T_PULSE_US);
+  pinW(PIN_5, HIGH);
+  pinW(PIN_8, HIGH);
+}
+
+/* ============================================================
+   Write paths
+   ============================================================ */
+
+/*
+  LEFT chip — берём как известный рабочий путь:
+    CS2 active + STB(CN10-8)
+    PIN_5 держим LOW как write-state
+*/
+static void writeLeft(bool isData, uint8_t value)
+{
+  setA0(isData);
+  setDB(value);
+
+  // write-state
+  pinW(PIN_5, LOW);
+
+  delayMicroseconds(T_SETUP_US);
+  setCS2(true);
+  pulsePin8();
+  setCS2(false);
+  delayMicroseconds(T_HOLD_US);
+
+  pinW(PIN_5, HIGH);
+}
+
+/*
+  RIGHT chip — перебор гипотез
+*/
+static void writeRight(bool isData, uint8_t value)
+{
+  setA0(isData);
+  setDB(value);
+
+  switch (gMode)
+  {
+    case MODE_STB_ONLY:
+      // PIN_5 = write-state, STB = CN10-8
+      pinW(PIN_5, LOW);
+      delayMicroseconds(T_SETUP_US);
+      setCS2(false);
+      pulsePin8();
+      delayMicroseconds(T_HOLD_US);
+      pinW(PIN_5, HIGH);
+      break;
+
+    case MODE_WR_ONLY:
+      // CN10-5 как write strobe
+      pinW(PIN_8, HIGH);
+      delayMicroseconds(T_SETUP_US);
+      setCS2(false);
+      pulsePin5();
+      delayMicroseconds(T_HOLD_US);
+      break;
+
+    case MODE_WR_AND_STB:
+      // оба вместе
+      delayMicroseconds(T_SETUP_US);
+      setCS2(false);
+      pulseBoth();
+      delayMicroseconds(T_HOLD_US);
+      break;
+
+    case MODE_CS2_INV_STB:
+      // вдруг chip0 выбирается active CS2, а не inactive
+      pinW(PIN_5, LOW);
+      delayMicroseconds(T_SETUP_US);
+      setCS2(true);
+      pulsePin8();
+      setCS2(false);
+      delayMicroseconds(T_HOLD_US);
+      pinW(PIN_5, HIGH);
+      break;
+  }
+}
+
+static inline void lcdCmd(uint8_t chip, uint8_t cmd)
+{
+  if (chip == 1) writeLeft(false, cmd);
+  else           writeRight(false, cmd);
+}
+
+static inline void lcdData(uint8_t chip, uint8_t data)
+{
+  if (chip == 1) writeLeft(true, data);
+  else           writeRight(true, data);
+}
+
+/* ============================================================
+   SED1520 init
+   ============================================================ */
+static void lcdResetHw(void)
+{
+  idlePins();
+
+  setRST(true);
+  delay(30);
+  setRST(false);
+  delay(60);
+}
+
+static void lcdSetPageCol(uint8_t chip, uint8_t page, uint8_t col)
+{
+  uint8_t phys = COL_START + col;
+  if (phys >= LCD_RAM_COLS) phys = LCD_RAM_COLS - 1;
+
+  lcdCmd(chip, CMD_SET_PAGE | (page & 0x03));
+  lcdCmd(chip, CMD_SET_COLUMN | phys);
+}
+
+static void lcdInitChip(uint8_t chip)
+{
+  lcdCmd(chip, CMD_DISPLAY_OFF);
+  delay(4);
+
+  lcdCmd(chip, CMD_RESET);
+  delay(4);
+
+  lcdCmd(chip, CMD_DUTY_16);
+  delay(4);
+
+  lcdCmd(chip, CMD_ADC_FORWARD);
+  delay(4);
+
+  lcdCmd(chip, CMD_STATIC_DRIVE_OFF);
+  delay(4);
+
+  lcdCmd(chip, CMD_DISPLAY_START_LINE | 0);
+  delay(4);
+
+  lcdCmd(chip, CMD_DISPLAY_ON);
+  delay(4);
+}
+
+static void lcdInit(void)
+{
+  lcdResetHw();
+  lcdInitChip(1); // LEFT
+  lcdInitChip(0); // RIGHT
+}
+
+/* ============================================================
+   Fill helpers
+   ============================================================ */
+static void fillHalf(uint8_t chip, uint8_t p0, uint8_t p1)
+{
+  for (uint8_t page = 0; page < LCD_PAGES; page++)
+  {
+    lcdSetPageCol(chip, page, 0);
+
+    uint8_t pat = (page == 0) ? p0 : p1;
+
+    for (uint8_t x = 0; x < LCD_HALF_WIDTH; x++)
+      lcdData(chip, pat);
+
+    delayMicroseconds(200);
+  }
+}
+
+static void clearAll(void)
+{
+  fillHalf(1, 0x00, 0x00); // LEFT
+  fillHalf(0, 0x00, 0x00); // RIGHT
+}
+
+/* ============================================================
+   One test case
+   ============================================================ */
+static void runCase(TestMode m)
+{
+  gMode = m;
+
+  Serial.println();
+  Serial.print(F("TEST RIGHT = "));
+  Serial.println(modeName(gMode));
+
+  lcdInit();
+
+  // 1) LEFT ON, RIGHT OFF
+  fillHalf(1, 0xFF, 0xFF);
+  fillHalf(0, 0x00, 0x00);
+  delay(1200);
+
+  // 2) LEFT OFF, RIGHT ON
+  fillHalf(1, 0x00, 0x00);
+  fillHalf(0, 0xFF, 0xFF);
+  delay(1200);
+
+  // 3) LEFT stripes, RIGHT inverse stripes
+  fillHalf(1, 0xAA, 0x55);
+  fillHalf(0, 0x55, 0xAA);
+  delay(1500);
+
+  clearAll();
+  delay(800);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(PIN_A0, OUTPUT);
+  pinMode(PIN_5, OUTPUT);
+  pinMode(PIN_8, OUTPUT);
+  pinMode(PIN_CS2, OUTPUT);
+  pinMode(PIN_RST, OUTPUT);
+
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    pinMode(DB[i], OUTPUT);
+    digitalWrite(DB[i], LOW);
+  }
+
+  idlePins();
+  setRST(false);
+
+  delay(50);
+  Serial.println(F("LAST SHORT DIAGNOSTIC START"));
+}
+
+void loop()
+{
+  runCase(MODE_STB_ONLY);
+  runCase(MODE_WR_ONLY);
+  runCase(MODE_WR_AND_STB);
+  runCase(MODE_CS2_INV_STB);
+}
