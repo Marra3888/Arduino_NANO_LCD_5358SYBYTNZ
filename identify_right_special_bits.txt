@@ -1,0 +1,236 @@
+#include <Arduino.h>
+
+/*
+  IDENTIFY RIGHT SPECIAL BITS
+  ===========================
+
+  Tests RIGHT special columns:
+    74, 75, 76
+
+  For each page and bit:
+    writes exactly one bit
+    waits
+    prints info to Serial
+
+  Goal:
+    identify exact mapping for:
+      A B C D
+      R S X Z
+      4 right triangles
+*/
+
+/* ---------------- Commands ---------------- */
+#define CMD_DISPLAY_OFF          0xAE
+#define CMD_DISPLAY_ON           0xAF
+#define CMD_DISPLAY_START_LINE   0xC0
+#define CMD_SET_PAGE             0xB8
+#define CMD_SET_COLUMN           0x00
+#define CMD_ADC_FORWARD          0xA0
+#define CMD_STATIC_DRIVE_OFF     0xA4
+#define CMD_DUTY_16              0xA8
+#define CMD_RESET                0xE2
+
+/* ---------------- Pins ---------------- */
+const uint8_t LCD_DB[8] = {2,3,4,5,6,7,8,9};
+
+#define LCD_PIN_A0    10
+#define LCD_PIN_MODE  11
+#define LCD_PIN_STB   12
+#define LCD_PIN_CS2   A1
+#define LCD_PIN_RST   A2
+
+/* ---------------- Mapping ---------------- */
+#define CHIP_LEFT         0
+#define CHIP_RIGHT        1
+#define LEFT_CHIP_IS_CS2  1
+
+/*
+  Screen RIGHT is driven by this physical chip on your module:
+*/
+#define PHYS_CHIP_SCREEN_RIGHT  CHIP_LEFT
+
+#define RIGHT_SPEC_COL_0  74
+#define RIGHT_SPEC_COL_1  75
+#define RIGHT_SPEC_COL_2  76
+
+/* ---------------- Geometry ---------------- */
+#define LCD_PAGES      2
+#define LCD_RAM_COLS   80
+
+/* ---------------- Timing ---------------- */
+#define T_SETUP_US     2
+#define T_PULSE_US     2
+#define T_HOLD_US      2
+#define STEP_DELAY_MS  2000
+
+/* ============================================================ */
+static inline void pinW(uint8_t pin, bool level) { digitalWrite(pin, level ? HIGH : LOW); }
+static inline bool activeToLevel(bool active, bool activeLow) { return activeLow ? !active : active; }
+
+static inline bool chipNeedsCS2Active(uint8_t chip)
+{
+#if LEFT_CHIP_IS_CS2
+  return (chip == CHIP_LEFT);
+#else
+  return (chip == CHIP_RIGHT);
+#endif
+}
+
+static inline void setA0(bool isData) { pinW(LCD_PIN_A0, isData); }
+static inline void setCS2(bool active) { pinW(LCD_PIN_CS2, activeToLevel(active, true)); }
+static inline void setRST(bool active) { pinW(LCD_PIN_RST, active); }
+static inline void modeIdle(void) { pinW(LCD_PIN_MODE, HIGH); }
+static inline void modeWriteBegin(void) { pinW(LCD_PIN_MODE, LOW); }
+static inline void modeWriteEnd(void) { pinW(LCD_PIN_MODE, HIGH); }
+static inline void stbIdle(void) { pinW(LCD_PIN_STB, HIGH); }
+
+static inline void pulseStrobe(void)
+{
+  pinW(LCD_PIN_STB, LOW);
+  delayMicroseconds(T_PULSE_US);
+  pinW(LCD_PIN_STB, HIGH);
+}
+
+static inline void setDataBus(uint8_t value)
+{
+  for (uint8_t i = 0; i < 8; i++)
+    pinW(LCD_DB[i], (value >> i) & 1);
+}
+
+static void lcdWriteByte(uint8_t chip, bool isData, uint8_t value)
+{
+  setA0(isData);
+  setDataBus(value);
+
+  modeIdle();
+  delayMicroseconds(1);
+
+  modeWriteBegin();
+  setCS2(chipNeedsCS2Active(chip));
+  delayMicroseconds(T_SETUP_US);
+  pulseStrobe();
+  setCS2(false);
+  modeWriteEnd();
+
+  delayMicroseconds(T_HOLD_US);
+}
+
+static inline void lcdCmd(uint8_t chip, uint8_t cmd) { lcdWriteByte(chip, false, cmd); }
+static inline void lcdData(uint8_t chip, uint8_t data) { lcdWriteByte(chip, true, data); }
+
+static void lcdResetHw(void)
+{
+  modeIdle();
+  setCS2(false);
+  setA0(false);
+  stbIdle();
+
+  setRST(true);
+  delay(30);
+  setRST(false);
+  delay(60);
+}
+
+static void lcdSetPageCol(uint8_t chip, uint8_t page, uint8_t col)
+{
+  if (col >= LCD_RAM_COLS) col = LCD_RAM_COLS - 1;
+  lcdCmd(chip, CMD_SET_PAGE | (page & 0x03));
+  lcdCmd(chip, CMD_SET_COLUMN | (col & 0x7F));
+}
+
+static void lcdInitChip(uint8_t chip)
+{
+  lcdCmd(chip, CMD_DISPLAY_OFF);        delay(4);
+  lcdCmd(chip, CMD_RESET);              delay(4);
+  lcdCmd(chip, CMD_SET_PAGE | 0x00);    delay(4);
+  lcdCmd(chip, CMD_SET_COLUMN | 0x00);  delay(4);
+  lcdCmd(chip, CMD_DUTY_16);            delay(4);
+  lcdCmd(chip, CMD_ADC_FORWARD);        delay(4);
+  lcdCmd(chip, CMD_STATIC_DRIVE_OFF);   delay(4);
+  lcdCmd(chip, CMD_DISPLAY_START_LINE); delay(4);
+  lcdCmd(chip, CMD_DISPLAY_ON);         delay(4);
+}
+
+static void lcdInit(void)
+{
+  lcdResetHw();
+  lcdInitChip(CHIP_LEFT);
+  lcdInitChip(CHIP_RIGHT);
+}
+
+static void clearChip(uint8_t chip)
+{
+  for (uint8_t page = 0; page < 2; page++)
+  {
+    lcdSetPageCol(chip, page, 0);
+    for (uint8_t col = 0; col < 80; col++)
+      lcdData(chip, 0x00);
+  }
+}
+
+static void clearAll(void)
+{
+  clearChip(CHIP_LEFT);
+  clearChip(CHIP_RIGHT);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(LCD_PIN_A0, OUTPUT);
+  pinMode(LCD_PIN_MODE, OUTPUT);
+  pinMode(LCD_PIN_STB, OUTPUT);
+  pinMode(LCD_PIN_CS2, OUTPUT);
+  pinMode(LCD_PIN_RST, OUTPUT);
+
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    pinMode(LCD_DB[i], OUTPUT);
+    digitalWrite(LCD_DB[i], LOW);
+  }
+
+  modeIdle();
+  setCS2(false);
+  setA0(false);
+  stbIdle();
+  setRST(false);
+
+  delay(50);
+  lcdInit();
+  clearAll();
+
+  Serial.println(F("IDENTIFY RIGHT SPECIAL BITS START"));
+}
+
+void loop()
+{
+  const uint8_t cols[] = {74, 75, 76};
+
+  for (uint8_t ci = 0; ci < sizeof(cols); ci++)
+  {
+    for (uint8_t page = 0; page < 2; page++)
+    {
+      for (uint8_t bit = 0; bit < 8; bit++)
+      {
+        uint8_t mask = (1 << bit);
+
+        clearAll();
+        lcdSetPageCol(PHYS_CHIP_SCREEN_RIGHT, page, cols[ci]);
+        lcdData(PHYS_CHIP_SCREEN_RIGHT, mask);
+
+        Serial.print(F("RIGHT_SPECIAL col="));
+        Serial.print(cols[ci]);
+        Serial.print(F(" page="));
+        Serial.print(page);
+        Serial.print(F(" bit="));
+        Serial.print(bit);
+        Serial.print(F(" mask=0x"));
+        if (mask < 16) Serial.print('0');
+        Serial.println(mask, HEX);
+
+        delay(STEP_DELAY_MS);
+      }
+    }
+  }
+}
